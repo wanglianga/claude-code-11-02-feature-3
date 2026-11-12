@@ -54,15 +54,16 @@ export class FilesController {
     fs.createReadStream(abs).pipe(res);
   }
 
-  /** 人工补传：覆盖同一 门店×平台×账号×日期 的自动数据 */
+  /** 人工补传：默认永久覆盖；substitute=1 时登记为临时替代（正式文件到达后自动替换） */
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
   async upload(
     @UploadedFile() file: Express.Multer.File,
-    @Body() body: { storeId?: string; platformId?: string; accountId?: string; bizDate?: string },
+    @Body() body: { storeId?: string; platformId?: string; accountId?: string; bizDate?: string; substitute?: string },
   ) {
     if (!file) throw new BadRequestException('缺少文件');
     const { storeId, platformId, accountId, bizDate } = body || {};
+    const substitute = body?.substitute === '1' || body?.substitute === 'true';
     if (!storeId || !platformId || !accountId || !/^\d{4}-\d{2}-\d{2}$/.test(bizDate || '')) {
       throw new BadRequestException('storeId/platformId/accountId/bizDate 必填');
     }
@@ -72,8 +73,18 @@ export class FilesController {
        WHERE a.id=$1 AND a.store_id=$2 AND a.platform_id=$3`, [+accountId, +storeId, +platformId]);
     if (!account) throw new BadRequestException('账号与门店/平台不匹配');
 
+    // 临时替代仅用于缺口：已有正式文件时不允许再采用替代来源
+    if (substitute) {
+      const official = await one(
+        `SELECT 1 FROM collected_files WHERE store_id=$1 AND platform_id=$2 AND account_id=$3 AND biz_date=$4
+           AND status='active' AND COALESCE(meta->>'substitute','false') <> 'true'`,
+        [+storeId, +platformId, +accountId, bizDate]);
+      if (official) throw new BadRequestException('该单元格已有正式文件，无需再采用临时替代来源');
+    }
+
     const safeName = path.basename(file.originalname || 'upload.bin');
-    const rel = path.join('files', account.store_code, account.platform_code, bizDate!, `manual-${Date.now()}-${safeName}`);
+    const rel = path.join('files', account.store_code, account.platform_code, bizDate!,
+      `${substitute ? 'substitute' : 'manual'}-${Date.now()}-${safeName}`);
     const abs = path.join(DATA_DIR, rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, file.buffer);
@@ -89,14 +100,23 @@ export class FilesController {
     const task = await one<any>(
       `SELECT id FROM source_tasks WHERE store_id=$1 AND platform_id=$2 AND account_id=$3 AND biz_date=$4`,
       [+storeId, +platformId, +accountId, bizDate]);
+    const meta = substitute
+      ? { uploaded_by: 'ops', substitute: true, substitute_method: 'manual_upload' }
+      : { uploaded_by: 'ops' };
     const row = await one<{ id: string }>(
       `INSERT INTO collected_files(task_id, store_id, platform_id, account_id, biz_date, origin, file_name, file_path, sha256, size_bytes, revision, status, supersedes_id, meta)
        VALUES($1,$2,$3,$4,$5,'manual',$6,$7,$8,$9,$10,'active',$11,$12) RETURNING id`,
       [task?.id ?? null, +storeId, +platformId, +accountId, bizDate, safeName, rel, sha256,
-       file.buffer.length, revision, existing[0]?.id ?? null, JSON.stringify({ uploaded_by: 'ops' })],
+       file.buffer.length, revision, existing[0]?.id ?? null, JSON.stringify(meta)],
     );
-    if (task) await q(`UPDATE source_tasks SET status='succeeded', updated_at=now() WHERE id=$1`, [task.id]);
+    // 临时替代不改变任务状态（官方采集仍需继续/重跑，正式文件到达后替换）
+    if (task && !substitute) await q(`UPDATE source_tasks SET status='succeeded', updated_at=now() WHERE id=$1`, [task.id]);
     await parseQueue.add('parse', { fileId: row!.id });
-    return { ok: true, fileId: row!.id, revision, superseded: existing.map((f) => f.id) };
+    return {
+      ok: true, fileId: row!.id, revision, superseded: existing.map((f) => f.id), substitute,
+      notice: substitute
+        ? '已登记为临时替代来源：数据不会写入正式日结；官方文件到达后自动生成替换记录。'
+        : '已登记为人工正式补传。',
+    };
   }
 }

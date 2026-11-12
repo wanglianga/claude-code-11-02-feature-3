@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { one, q } from './db';
 import { collectQueue } from './queues';
+import { buildSuggestions } from './substitutions';
 
 @Controller()
 export class TasksController {
@@ -68,7 +69,7 @@ export class TasksController {
     if (!task) return { error: 'not found' };
     const [runs, files, interventions] = await Promise.all([
       q(`SELECT * FROM task_runs WHERE task_id=$1 ORDER BY attempt_no DESC`, [id]),
-      q(`SELECT id, run_id, origin, file_name, sha256, size_bytes, downloaded_at, revision, status, supersedes_id
+      q(`SELECT id, run_id, origin, file_name, sha256, size_bytes, downloaded_at, revision, status, supersedes_id, meta
          FROM collected_files WHERE task_id=$1 ORDER BY created_at DESC`, [id]),
       q(`SELECT * FROM interventions WHERE task_id=$1 ORDER BY created_at DESC`, [id]),
     ]);
@@ -126,27 +127,85 @@ export class TasksController {
     return { ok: true, days: days.length, enqueued };
   }
 
-  /** 今日采集看板：门店 × 平台 矩阵 + 缺报清单 */
+  /** 今日采集看板：门店 × 平台 矩阵 + 缺报清单 + 替代来源建议 */
   @Get('dashboard')
   async dashboard(@Query('date') date: string) {
     const d = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : new Date().toISOString().slice(0, 10);
     const cells = await q(
       `SELECT s.id AS store_id, s.code AS store_code, s.name AS store_name, s.kind,
+              s.pos_system, s.arrival_offset_min,
               p.id AS platform_id, p.code AS platform_code, p.name AS platform_name,
-              (SELECT json_agg(json_build_object('taskId', t.id, 'username', a.username, 'status', t.status, 'lastError', t.last_error))
+              p.expected_arrival::text AS expected_arrival,
+              (SELECT json_agg(json_build_object('taskId', t.id, 'accountId', t.account_id, 'username', a.username, 'status', t.status, 'lastError', t.last_error))
                FROM source_tasks t JOIN platform_accounts a ON a.id=t.account_id
                WHERE t.store_id=s.id AND t.platform_id=p.id AND t.biz_date=$1) AS tasks,
-              (SELECT count(*) FROM collected_files f WHERE f.store_id=s.id AND f.platform_id=p.id AND f.biz_date=$1 AND f.status='active') AS active_files,
+              (SELECT count(*) FROM collected_files f WHERE f.store_id=s.id AND f.platform_id=p.id AND f.biz_date=$1
+                 AND f.status='active' AND COALESCE(f.meta->>'substitute','false') <> 'true') AS active_files,
+              (SELECT count(*) FROM collected_files f WHERE f.store_id=s.id AND f.platform_id=p.id AND f.biz_date=$1
+                 AND f.status='active' AND COALESCE(f.meta->>'substitute','false') = 'true') AS substitute_files,
               (SELECT count(*) FROM collected_files f WHERE f.store_id=s.id AND f.platform_id=p.id AND f.biz_date=$1) AS total_files
        FROM stores s CROSS JOIN platforms p WHERE p.enabled ORDER BY s.code, p.code`, [d]);
-    const missing = cells
-      .filter((c: any) => !(+c.active_files > 0) && !(c.tasks || []).some((t: any) => t.status === 'succeeded'))
-      .map((c: any) => ({ store: c.store_code, platform: c.platform_code, status: (c.tasks || []).map((t: any) => t.status).join(',') || '未生成任务' }));
+
+    const subs = await q<any>(
+      `SELECT e.*, e.biz_date::text, e.based_on_date::text AS based_on_date, e.replaced_at::text AS replaced_at,
+              s.code AS store_code, p.code AS platform_code, a.username,
+              cf.file_name, rcf.file_name AS replaced_by_file_name
+       FROM substitute_entries e
+       JOIN stores s ON s.id=e.store_id JOIN platforms p ON p.id=e.platform_id
+       LEFT JOIN platform_accounts a ON a.id=e.account_id
+       LEFT JOIN collected_files cf ON cf.id=e.file_id
+       LEFT JOIN collected_files rcf ON rcf.id=e.replaced_by_file_id
+       WHERE e.biz_date=$1 ORDER BY e.created_at`, [d]);
+    const subsByCell: Record<string, any[]> = {};
+    for (const e of subs) {
+      const key = `${e.store_id}:${e.platform_id}`;
+      (subsByCell[key] ||= []).push(e);
+    }
+    for (const c of cells) {
+      const list = subsByCell[`${c.store_id}:${c.platform_id}`] || [];
+      c.substituteEntries = list;
+      c.activeSubstitute = list.find((e: any) => e.status === 'active') || null;
+      c.lastReplacedSubstitute = [...list].reverse().find((e: any) => e.status === 'replaced') || null;
+    }
+
+    const missing: any[] = [];
+    for (const c of cells) {
+      const taskStatuses = (c.tasks || []).map((t: any) => t.status);
+      const covered = +c.active_files > 0 || taskStatuses.some((s: string) => s === 'succeeded');
+      if (covered) continue;
+      const suggestions = await buildSuggestions({
+        storeId: c.store_id, platformId: c.platform_id,
+        platformCode: c.platform_code, platformName: c.platform_name,
+        storeCode: c.store_code, storeKind: c.kind, posSystem: c.pos_system,
+        expectedArrival: c.expected_arrival, arrivalOffsetMin: c.arrival_offset_min,
+        date: d, taskStatuses,
+      });
+      missing.push({
+        storeId: c.store_id, platformId: c.platform_id,
+        store: c.store_code, storeName: c.store_name,
+        platform: c.platform_code, platformName: c.platform_name,
+        status: taskStatuses.join(',') || '未生成任务',
+        taskStatuses,
+        tasks: c.tasks || [],
+        activeSubstitute: c.activeSubstitute,
+        lastReplacedSubstitute: c.lastReplacedSubstitute,
+        evidence: suggestions.evidence,
+        methods: suggestions.methods,
+        recommendation: suggestions.recommendation,
+        recommendedMethod: suggestions.recommendedMethod,
+        waitRecommended: suggestions.waitRecommended,
+        waitReason: suggestions.waitReason,
+      });
+    }
+
     const summary = {
       date: d,
       cells: cells.length,
       covered: cells.length - missing.length,
       missing: missing.length,
+      substituted: subs.filter((e: any) => e.status === 'active').length,
+      replacements: +(await one<{ c: number }>(
+        `SELECT count(*)::int c FROM substitution_replacements WHERE biz_date=$1`, [d]))!.c,
       openInterventions: +(await one<{ c: number }>(`SELECT count(*)::int c FROM interventions WHERE status='open'`))!.c,
       openIssues: +(await one<{ c: number }>(`SELECT count(*)::int c FROM mapping_issues WHERE status='open'`))!.c,
     };
@@ -159,7 +218,7 @@ export class TasksController {
     const d = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : new Date().toISOString().slice(0, 10);
     const store = await one(`SELECT * FROM stores WHERE id=$1`, [+id]);
     if (!store) return { error: 'not found' };
-    const [facts, files, tasks] = await Promise.all([
+    const [facts, files, tasks, substitutions, replacements] = await Promise.all([
       q(`SELECT f.metric, f.value, f.origin, f.updated_at,
                 p.code AS platform_code, p.name AS platform_name, a.username,
                 f.file_id, cf.file_name, cf.sha256, cf.revision AS file_revision, cf.downloaded_at,
@@ -170,7 +229,7 @@ export class TasksController {
          LEFT JOIN collected_files cf ON cf.id=f.file_id
          LEFT JOIN parse_batches pb ON pb.id=f.batch_id
          WHERE f.store_id=$1 AND f.biz_date=$2 ORDER BY p.code, a.username, f.metric`, [+id, d]),
-      q(`SELECT f.id, f.origin, f.file_name, f.sha256, f.size_bytes, f.downloaded_at, f.revision, f.status,
+      q(`SELECT f.id, f.origin, f.file_name, f.sha256, f.size_bytes, f.downloaded_at, f.revision, f.status, f.meta,
                 p.code AS platform_code, a.username,
                 (SELECT json_build_object('status', b.status, 'rows_total', b.rows_total, 'rows_parsed', b.rows_parsed,
                          'rows_skipped', b.rows_skipped, 'parser_version', b.parser_version, 'mapping_version', b.mapping_version)
@@ -180,7 +239,21 @@ export class TasksController {
       q(`SELECT t.id, t.status, t.source_kind, t.last_error, t.run_count, p.code AS platform_code, a.username
          FROM source_tasks t JOIN platforms p ON p.id=t.platform_id JOIN platform_accounts a ON a.id=t.account_id
          WHERE t.store_id=$1 AND t.biz_date=$2 ORDER BY p.code`, [+id, d]),
+      q(`SELECT e.*, e.biz_date::text, e.based_on_date::text AS based_on_date, e.replaced_at::text AS replaced_at,
+                p.code AS platform_code, p.name AS platform_name, a.username,
+                cf.file_name, rcf.file_name AS replaced_by_file_name
+         FROM substitute_entries e
+         JOIN platforms p ON p.id=e.platform_id
+         LEFT JOIN platform_accounts a ON a.id=e.account_id
+         LEFT JOIN collected_files cf ON cf.id=e.file_id
+         LEFT JOIN collected_files rcf ON rcf.id=e.replaced_by_file_id
+         WHERE e.store_id=$1 AND e.biz_date=$2 ORDER BY e.created_at`, [+id, d]),
+      q(`SELECT r.*, r.biz_date::text, p.code AS platform_code,
+                cf.file_name AS replaced_by_file_name
+         FROM substitution_replacements r JOIN platforms p ON p.id=r.platform_id
+         LEFT JOIN collected_files cf ON cf.id=r.replaced_by_file_id
+         WHERE r.store_id=$1 AND r.biz_date=$2 ORDER BY r.created_at`, [+id, d]),
     ]);
-    return { date: d, store, facts, files, tasks };
+    return { date: d, store, facts, files, tasks, substitutions, replacements };
   }
 }

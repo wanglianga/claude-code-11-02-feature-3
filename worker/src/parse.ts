@@ -3,6 +3,7 @@ import path from 'path';
 import XLSX from 'xlsx';
 import { one, q } from './db';
 import { env } from './env';
+import { isSubstituteFile, recordArrival, resolveSubstitutions } from './substitute';
 
 export const PARSER_VERSION = 'parser.v1';
 export const mappingVersion = (platform: string) => `map.${platform}.v1`;
@@ -203,7 +204,8 @@ export async function processParse(job: { data: { fileId: string } }) {
   const { fileId } = job.data;
   const file = await one<any>(
     `SELECT f.id, f.task_id, f.run_id, f.store_id, f.platform_id, f.account_id,
-            f.biz_date::text AS biz_date, f.origin, f.file_name, f.file_path, f.sha256, f.status,
+            f.biz_date::text AS biz_date, f.origin, f.file_name, f.file_path, f.sha256, f.status, f.meta,
+            f.downloaded_at::text AS downloaded_at,
             p.code AS platform_code, p.day_cutoff::text AS day_cutoff, s.code AS store_code
      FROM collected_files f JOIN platforms p ON p.id=f.platform_id JOIN stores s ON s.id=f.store_id
      WHERE f.id=$1`, [fileId]);
@@ -264,6 +266,32 @@ export async function processParse(job: { data: { fileId: string } }) {
 
   // 统一日经营事实：人工数据优先于自动数据
   const origin = file.origin === 'manual' ? 'manual' : 'auto';
+
+  // 临时替代文件：只写 substitute_entries（来源标记），绝不写入 daily_facts 正式日结
+  if (isSubstituteFile(file)) {
+    const values: Record<string, number> = {};
+    const dayMetrics = acc.metrics.get(file.biz_date);
+    if (dayMetrics) for (const [metric, value] of dayMetrics) values[metric] = value;
+    await q(
+      `UPDATE substitute_entries SET status='cancelled'
+       WHERE store_id=$1 AND platform_id=$2 AND biz_date=$3 AND status='active'
+         AND (account_id=$4 OR account_id IS NULL)`,
+      [file.store_id, file.platform_id, file.biz_date, file.account_id],
+    );
+    await q(
+      `INSERT INTO substitute_entries(store_id, platform_id, account_id, biz_date, method, scope,
+         values, evidence, file_id, status, created_by)
+       VALUES($1,$2,$3,$4,$5,'platform',$6,$7,$8,'active','ops')`,
+      [file.store_id, file.platform_id, file.account_id, file.biz_date,
+       file.meta?.substitute_method || 'manual_upload', JSON.stringify(values),
+       JSON.stringify({
+         source: 'manual_upload', file_name: file.file_name, sha256: file.sha256,
+         rows_parsed: acc.parsed, rows_skipped: acc.skipped,
+       }), fileId],
+    );
+    return;
+  }
+
   for (const [bizDate, metrics] of acc.metrics) {
     for (const [metric, value] of metrics) {
       await q(
@@ -276,4 +304,8 @@ export async function processParse(job: { data: { fileId: string } }) {
       );
     }
   }
+
+  // 正式文件到达：记录真实到数节奏，并替换仍在生效的临时替代（生成替换记录，不叠加）
+  await recordArrival(file);
+  await resolveSubstitutions(file);
 }

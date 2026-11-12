@@ -34,3 +34,43 @@ JOIN (VALUES
 ) AS a(platform_code, store_code, username, token)
   ON a.platform_code = p.code AND a.store_code = s.code
 ON CONFLICT (platform_id, store_id, username) DO NOTHING;
+
+-- 平台基准到数时间（历史到数节奏的基准，门店偏移见 stores.arrival_offset_min）
+UPDATE platforms SET expected_arrival = CASE code
+  WHEN 'ALPHA' THEN TIME '08:30'
+  WHEN 'BETA'  THEN TIME '09:15'
+  WHEN 'GAMMA' THEN TIME '07:45'
+  ELSE expected_arrival END;
+
+-- 门店收银系统可用性（直营接入可导出；加盟店自有收银无法导出）
+UPDATE stores SET
+  pos_system = CASE code WHEN 'S001' THEN '海鼎POS' WHEN 'S002' THEN '思迅POS' ELSE NULL END,
+  arrival_offset_min = CASE code WHEN 'S001' THEN 0 WHEN 'S002' THEN 10 WHEN 'S003' THEN 25 ELSE 5 END;
+
+-- 近30天到数历史（确定性种子）：用于“平均到数时间 / 延迟概率 / P90 延迟”建议依据
+INSERT INTO arrival_history(store_id, platform_id, biz_date, expected_at, arrived_at, delay_minutes, was_delayed, source)
+SELECT s.id, p.id, (CURRENT_DATE - g)::date,
+       (p.expected_arrival + (s.arrival_offset_min || ' minutes')::interval)::time,
+       ((CURRENT_DATE - g)::date + interval '1 day')::timestamp
+         + (p.expected_arrival + (s.arrival_offset_min || ' minutes')::interval)::time
+         + (d.delay_min || ' minutes')::interval AS arrived_at,
+       d.delay_min,
+       d.delay_min > 30,
+       'history'
+FROM stores s
+CROSS JOIN platforms p
+CROSS JOIN generate_series(1, 30) AS g
+CROSS JOIN LATERAL (
+  SELECT CASE p.code
+    WHEN 'ALPHA' THEN CASE WHEN (g * 7 + s.id * 3 + p.id) % 20 < 3
+                           THEN 35 + ((g * 17 + s.id * 5 + p.id * 11) % 130) ELSE 0 END
+    WHEN 'BETA'  THEN CASE WHEN (g * 7 + s.id * 2 + p.id) % 10 < 3
+                           THEN 40 + ((g * 13 + s.id * 7) % 100) ELSE 0 END
+    ELSE CASE WHEN (g * 11 + s.id * 5 + p.id * 3) % 20 < 11
+                           THEN 240 + ((g * 29 + s.id * 11) % 900) ELSE 0 END
+  END AS delay_min
+) d
+WHERE NOT EXISTS (
+  SELECT 1 FROM arrival_history h
+  WHERE h.store_id = s.id AND h.platform_id = p.id AND h.biz_date = (CURRENT_DATE - g)::date
+);

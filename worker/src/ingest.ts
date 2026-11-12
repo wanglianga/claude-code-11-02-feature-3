@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { one, q } from './db';
 import { env } from './env';
+import { isSubstituteFile } from './substitute';
 
 export interface RegisterResult {
   parse: boolean;
@@ -47,8 +48,8 @@ export async function registerCollectedFile(opts: {
      ORDER BY created_at`, [base.store_id, base.platform_id, base.account_id, base.biz_date],
   );
 
-  // 人工补传优先：自动文件保留为证据但不解析（先于哈希去重判断）
-  const activeManual = existing.find((f) => f.status === 'active' && f.origin === 'manual');
+  // 人工补传优先：自动文件保留为证据但不解析（临时替代文件除外——正式文件应替换它）
+  const activeManual = existing.find((f) => f.status === 'active' && f.origin === 'manual' && !isSubstituteFile(f));
   if (activeManual) {
     const row = await one<{ id: string }>(
       `INSERT INTO collected_files(task_id,run_id,store_id,platform_id,account_id,biz_date,origin,file_name,file_path,sha256,size_bytes,status,meta)

@@ -50,6 +50,18 @@ export const KIND_LABELS: Record<string, string> = {
   login_expired: '登录失效',
 };
 
+export const METHOD_LABELS: Record<string, string> = {
+  manual_upload: '人工上传平台报表',
+  pos: '收银系统',
+  prev_estimate: '前一日预估',
+};
+
+export const SUB_STATUS_LABELS: Record<string, string> = {
+  active: '临时替代生效中',
+  replaced: '已由正式文件替换',
+  cancelled: '已取消',
+};
+
 export async function downloadEvidence(fileId: string, fileName: string) {
   const r = await api.get(`/files/${fileId}/download`, { responseType: 'blob' });
   const url = URL.createObjectURL(r.data);

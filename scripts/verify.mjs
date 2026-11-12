@@ -308,6 +308,128 @@ async function s11_domVariant() {
   ok('场景恢复后重跑成功', true);
 }
 
+/* ---------- 场景11：缺报替代来源 ---------- */
+
+async function s12_substitutions() {
+  console.log('\n■ 场景11 缺报替代来源（依据/来源标记/正式文件替换不叠加）');
+  const D0 = new Date().toISOString().slice(0, 10); // 当天：默认全部缺报
+
+  // 1) 缺报建议必须带历史依据（近30天平均到数/延迟概率/P90）
+  const dash0 = await api('GET', `/dashboard?date=${D0}`);
+  ok('当天未生成任务时 12 个单元格全部缺报', dash0.missing.length === 12, `missing=${dash0.missing.length}`);
+  const s1Alpha = dash0.missing.find((m) => m.store === 'S001' && m.platform === 'ALPHA');
+  const s3Alpha = dash0.missing.find((m) => m.store === 'S003' && m.platform === 'ALPHA');
+  ok('建议含近30天到数依据',
+    s1Alpha.evidence.sampleDays >= 29 && typeof s1Alpha.evidence.avgArrival === 'string'
+      && s1Alpha.evidence.delayRatePct >= 0 && s1Alpha.evidence.p90Arrival.length > 0,
+    `样本${s1Alpha.evidence.sampleDays}天 平均${s1Alpha.evidence.avgArrival} 延迟率${s1Alpha.evidence.delayRatePct}% P90${s1Alpha.evidence.p90Arrival}`);
+  const posMethod = s1Alpha.methods.find((m) => m.method === 'pos');
+  const posMethodS3 = s3Alpha.methods.find((m) => m.method === 'pos');
+  ok('直营门店可建议收银系统替代', posMethod.available === true && posMethod.reason.includes('海鼎POS'), posMethod.reason.slice(0, 60));
+  ok('无收银系统的门店明确标注不可用', posMethodS3.available === false && posMethodS3.reason.includes('未接入'), posMethodS3.reason.slice(0, 60));
+  const estMethod = s1Alpha.methods.find((m) => m.method === 'prev_estimate');
+  ok('前一日预估基于最近正式日 D1', estMethod.available === true && estMethod.basedOnDate === D1, `basedOn=${estMethod.basedOnDate}`);
+
+  // 2) 采用前一日预估（S001/ALPHA）：只写替代记录，不写正式事实
+  const d1Facts = await factsFor(1, D1);
+  const d1Gross = factVal(d1Facts, 'ALPHA', 'gross_sales');
+  const adoptEst = await api('POST', '/substitutions/adopt', {
+    storeId: 1, platformId: 1, bizDate: D0, method: 'prev_estimate',
+  });
+  ok('前一日预估采用成功', adoptEst.entry.status === 'active' && adoptEst.entry.method === 'prev_estimate');
+  ok('预估值等于最近正式日且带来源/依据快照',
+    +adoptEst.entry.values.gross_sales === d1Gross && adoptEst.entry.based_on_date === D1
+      && adoptEst.entry.evidence.snapshot.avgArrival && adoptEst.entry.evidence.snapshot.delayRatePct !== undefined,
+    `预估营业额=${adoptEst.entry.values.gross_sales} D1实际=${d1Gross}`);
+
+  // 3) 采用收银系统全店口径（S002/ALPHA）
+  const adoptPos = await api('POST', '/substitutions/adopt', {
+    storeId: 2, platformId: 1, bizDate: D0, method: 'pos', values: { gross_sales: 999 },
+  });
+  ok('收银系统替代按全店口径登记', adoptPos.entry.scope === 'store_total' && +adoptPos.entry.values.gross_sales === 999);
+  const posReject = await api('POST', '/substitutions/adopt', {
+    storeId: 3, platformId: 1, bizDate: D0, method: 'pos', values: { gross_sales: 1 },
+  }, true);
+  ok('无 POS 门店采用被拒绝', posReject.status === 400, `HTTP ${posReject.status}`);
+
+  // 4) 人工上传临时替代文件（S004/ALPHA），来源标记 substitute
+  const csv = ['#ALPHA日结报表 门店:S004 结算日:' + D0 + ' 修订:1', '订单号,下单时间,门店编码,类型,金额,原因',
+    `P001,${D0} 10:00,S004,ORDER,150.00,`, `P002,${D0} 11:00,S004,ORDER,50.00,`, '', '合计,,,,200.00,'].join('\r\n');
+  const fd = new FormData();
+  fd.append('file', new Blob([csv], { type: 'text/csv' }), `substitute_S004_${D0}.csv`);
+  const acctId4 = +sql(`SELECT id FROM platform_accounts WHERE username='s004' AND platform_id=1`);
+  fd.append('storeId', '4'); fd.append('platformId', '1'); fd.append('accountId', String(acctId4));
+  fd.append('bizDate', D0); fd.append('substitute', '1');
+  const up = await (await fetch(`${API}/api/files/upload`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}` }, body: fd })).json();
+  ok('人工临时替代上传带 substitute 标记', up.substitute === true && !!up.fileId, `fileId=${up.fileId}`);
+  await waitFor('人工替代解析为替代记录', async () => {
+    const n = +sql(`SELECT count(*) FROM substitute_entries WHERE store_id=4 AND platform_id=1 AND biz_date='${D0}' AND status='active' AND method='manual_upload'`);
+    return n === 1 ? true : null;
+  }, 30000);
+  const subMeta = sql(`SELECT meta->>'substitute' FROM collected_files WHERE id='${up.fileId}'`);
+  ok('替代文件 meta 来源标记落库', subMeta === 'true', subMeta);
+
+  // 5) 关键约束：三种替代都不得进入正式日结
+  const factCountBefore = +sql(`SELECT count(*) FROM daily_facts WHERE biz_date='${D0}'`);
+  ok('替代/预估数据未混入正式日结', factCountBefore === 0, `daily_facts D0 行数=${factCountBefore}`);
+  const dash1 = await api('GET', `/dashboard?date=${D0}`);
+  ok('看板统计临时替代生效数', dash1.summary.substituted === 3, `substituted=${dash1.summary.substituted}`);
+  const cellS1 = dash1.cells.find((c) => c.store_code === 'S001' && c.platform_code === 'ALPHA');
+  ok('缺报单元格展示生效中的替代来源', !!cellS1.activeSubstitute && cellS1.activeSubstitute.method === 'prev_estimate');
+
+  // 6) 正式采集到达：生成当天任务（GAMMA 当天 409 会失败，ALPHA/BETA 正常）
+  const gen = await api('POST', '/tasks/generate', { date: D0 });
+  ok('当天任务生成入队', gen.enqueued === 13, `enqueued=${gen.enqueued}`);
+  await waitFor('三条替代均被正式文件替换', async () => {
+    const n = +sql(`SELECT count(*) FROM substitution_replacements WHERE biz_date='${D0}'`);
+    return n >= 3 ? true : null;
+  }, 180000, 3000);
+
+  // 7) 替换记录内容：临时值 vs 正式值，且事实不叠加
+  const reps = await api('GET', `/substitutions/replacements?date=${D0}`);
+  ok('替换记录已生成（不是数字叠加）', reps.length >= 3, `replacements=${reps.length}`);
+  const repEst = reps.find((r) => r.method === 'prev_estimate');
+  const repPos = reps.find((r) => r.method === 'pos');
+  const repManual = reps.find((r) => r.method === 'manual_upload');
+  ok('三类替代方式均有替换记录', !!(repEst && repPos && repManual),
+    `methods=${reps.map((r) => r.method).join(',')}`);
+  const expD0 = await mockExpected('ALPHA', 'S001', D0);
+  const s1FactsD0 = await factsFor(1, D0);
+  const s1GrossD0 = factVal(s1FactsD0, 'ALPHA', 'gross_sales');
+  ok('正式值取平台文件、未与预估叠加',
+    s1GrossD0 === expD0.gross_sales && +repEst.provisional_values.gross_sales === d1Gross
+      && +repEst.official_values.gross_sales === expD0.gross_sales,
+    `临时=${repEst?.provisional_values?.gross_sales} 正式=${s1GrossD0} 期望=${expD0.gross_sales}`);
+  const s4FactsD0 = await factsFor(4, D0);
+  const s4GrossD0 = factVal(s4FactsD0, 'ALPHA', 'gross_sales');
+  const expS4 = await mockExpected('ALPHA', 'S004', D0);
+  ok('人工临时值 200 未与正式值叠加', s4GrossD0 === expS4.gross_sales && +repManual.provisional_values.gross_sales === 200,
+    `临时200 正式=${s4GrossD0} 期望=${expS4.gross_sales}`);
+  ok('POS 临时值与正式值分别留痕', +repPos.provisional_values.gross_sales === 999
+    && +repPos.official_values.gross_sales === (await mockExpected('ALPHA', 'S002', D0)).gross_sales);
+
+  // 8) 替代条目状态、文件状态、到数历史与门店日视图
+  const entries = await api('GET', `/substitutions?date=${D0}`);
+  ok('替代条目全部标记 replaced', entries.every((e) => e.status === 'replaced'), entries.map((e) => `${e.method}:${e.status}`).join(' '));
+  const supSub = +sql(`SELECT count(*) FROM collected_files WHERE store_id=4 AND platform_id=1 AND biz_date='${D0}' AND status='superseded' AND meta->>'substitute'='true'`);
+  ok('临时替代文件被正式文件取代（保留证据）', supSub >= 1, `superseded substitute files=${supSub}`);
+  const actualArrival = sql(`SELECT source FROM arrival_history WHERE store_id=1 AND platform_id=1 AND biz_date='${D0}'`);
+  ok('真实到数时间写入到数历史', actualArrival === 'actual', actualArrival);
+  const daily = await api('GET', `/stores/1/daily?date=${D0}`);
+  ok('门店日视图含替代区块与替换记录', Array.isArray(daily.substitutions) && Array.isArray(daily.replacements)
+    && daily.substitutions.some((e) => e.method === 'prev_estimate' && e.status === 'replaced')
+    && daily.replacements.some((r) => r.method === 'prev_estimate'));
+
+  // 9) 已有正式文件后禁止再登记临时替代
+  const blocked = await api('POST', '/substitutions/adopt', {
+    storeId: 1, platformId: 1, bizDate: D0, method: 'prev_estimate',
+  }, true);
+  ok('正式文件到达后预估建议不再可采用', blocked.status === 400, `HTTP ${blocked.status}`);
+  const dash2 = await api('GET', `/dashboard?date=${D0}`);
+  ok('看板替换统计更新、替代生效清零', dash2.summary.replacements >= 3 && dash2.summary.substituted === 0,
+    `replacements=${dash2.summary.replacements} substituted=${dash2.summary.substituted}`);
+}
+
 /* ---------- 主流程 ---------- */
 
 async function main() {
@@ -323,7 +445,8 @@ async function main() {
 
   // 干净起点
   await fetch(`${MOCK}/__reset`, { method: 'POST' });
-  sql(`TRUNCATE mapping_issues, interventions, raw_records, parse_batches, daily_facts, collected_files, run_steps, task_runs, source_tasks`);
+  sql(`TRUNCATE mapping_issues, interventions, raw_records, parse_batches, daily_facts,
+       substitution_replacements, substitute_entries, collected_files, run_steps, task_runs, source_tasks`);
   console.log('已重置场景与业务数据');
 
   await s1_normal();
@@ -336,6 +459,7 @@ async function main() {
   await s8_manualOverride();
   await s10_wrongFile();
   await s11_domVariant();
+  await s12_substitutions();
 
   console.log(`\n========== 验证结果: ${passed} 通过, ${failed} 失败 ==========`);
   process.exit(failed ? 1 : 0);

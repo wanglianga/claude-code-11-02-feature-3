@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS stores (
   id          SERIAL PRIMARY KEY,
   code        TEXT NOT NULL UNIQUE,
   name        TEXT NOT NULL,
-  kind        TEXT NOT NULL DEFAULT 'direct'  -- direct 直营 | franchise 加盟
+  kind        TEXT NOT NULL DEFAULT 'direct', -- direct 直营 | franchise 加盟
+  pos_system  TEXT,                            -- 可临时导出的收银系统；NULL 表示无可用收银数据
+  arrival_offset_min INT NOT NULL DEFAULT 0    -- 该门店相对平台基准到数时间的偏移（分钟）
 );
 
 -- 平台
@@ -16,8 +18,14 @@ CREATE TABLE IF NOT EXISTS platforms (
   name        TEXT NOT NULL,
   source_kind TEXT NOT NULL,                  -- web_export | download_center | api
   day_cutoff  TIME NOT NULL DEFAULT '00:00',  -- 日结切点：凌晨 cutoff 前的订单计入前一营业日
+  expected_arrival TIME NOT NULL DEFAULT '09:00', -- 平台历史基准到数时间（门店偏移见 stores.arrival_offset_min）
   enabled     BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- 兼容旧库：新增列（首次启动时 ALTER 不生效，已存在的库通过 IF NOT EXISTS 平滑升级）
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS pos_system TEXT;
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS arrival_offset_min INT NOT NULL DEFAULT 0;
+ALTER TABLE platforms ADD COLUMN IF NOT EXISTS expected_arrival TIME NOT NULL DEFAULT '09:00';
 
 -- 平台账号（同一门店在同一平台可有多个账号）
 CREATE TABLE IF NOT EXISTS platform_accounts (
@@ -170,3 +178,58 @@ CREATE TABLE IF NOT EXISTS interventions (
   resolved_at    TIMESTAMPTZ,
   resolved_by    TEXT
 );
+
+-- 平台到数历史：给“替代来源建议”提供依据（近30天平均到数时间 / 延迟概率 / P90）
+CREATE TABLE IF NOT EXISTS arrival_history (
+  id            BIGSERIAL PRIMARY KEY,
+  store_id      INT NOT NULL REFERENCES stores(id),
+  platform_id   INT NOT NULL REFERENCES platforms(id),
+  biz_date      DATE NOT NULL,
+  expected_at   TIME NOT NULL,                 -- 该门店×平台当日的基准到数时间
+  arrived_at    TIMESTAMPTZ,                   -- 实际到数时间（历史种子或真实采集完成时间）
+  delay_minutes INT NOT NULL DEFAULT 0,        -- 相对基准到数时间的延迟分钟数
+  was_delayed   BOOLEAN NOT NULL DEFAULT FALSE, -- 是否超过容差（>30 分钟）
+  source        TEXT NOT NULL DEFAULT 'history', -- history 种子 / actual 实际采集
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (store_id, platform_id, biz_date)
+);
+CREATE INDEX IF NOT EXISTS idx_arrival_window ON arrival_history(store_id, platform_id, biz_date);
+
+-- 替代来源采用记录：临时数据单独存放，绝不写入 daily_facts 正式日结
+CREATE TABLE IF NOT EXISTS substitute_entries (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  store_id            INT NOT NULL REFERENCES stores(id),
+  platform_id         INT NOT NULL REFERENCES platforms(id),
+  account_id          INT REFERENCES platform_accounts(id),
+  biz_date            DATE NOT NULL,
+  method              TEXT NOT NULL,              -- manual_upload | pos | prev_estimate
+  scope               TEXT NOT NULL DEFAULT 'platform', -- platform 平台明细 | store_total 全店口径
+  values              JSONB NOT NULL,             -- metric -> value（临时值）
+  based_on_date       DATE,                       -- 前一日预估所依据的最近正式营业日
+  evidence            JSONB,                      -- 建议依据快照（平均到数/延迟概率/波动率等）
+  file_id             UUID REFERENCES collected_files(id),
+  status              TEXT NOT NULL DEFAULT 'active', -- active | replaced | cancelled
+  created_by          TEXT NOT NULL DEFAULT 'ops',
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  replaced_at         TIMESTAMPTZ,
+  replaced_by_file_id UUID REFERENCES collected_files(id),
+  replaced_by_values  JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_substitute_key ON substitute_entries(store_id, platform_id, biz_date, status);
+
+-- 替换记录：正式文件到达时，替代数据被明确替换（不是两种来源相加）
+CREATE TABLE IF NOT EXISTS substitution_replacements (
+  id                  BIGSERIAL PRIMARY KEY,
+  entry_id            UUID NOT NULL REFERENCES substitute_entries(id),
+  store_id            INT NOT NULL REFERENCES stores(id),
+  platform_id         INT NOT NULL REFERENCES platforms(id),
+  account_id          INT REFERENCES platform_accounts(id),
+  biz_date            DATE NOT NULL,
+  method              TEXT NOT NULL,
+  provisional_values  JSONB,
+  official_values     JSONB,
+  replaced_by_file_id UUID REFERENCES collected_files(id),
+  note                TEXT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_replacements_key ON substitution_replacements(store_id, platform_id, biz_date);

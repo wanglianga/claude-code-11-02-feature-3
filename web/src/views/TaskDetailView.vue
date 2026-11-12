@@ -58,9 +58,10 @@
           <template #default="{ row }"><code>{{ row.sha256.slice(0, 10) }}</code></template>
         </el-table-column>
         <el-table-column prop="revision" label="修订" width="60" />
-        <el-table-column prop="origin" label="来源" width="70">
+        <el-table-column label="来源" width="100">
           <template #default="{ row }">
-            <el-tag size="small" :type="row.origin === 'manual' ? 'warning' : 'info'">{{ row.origin === 'manual' ? '人工' : '自动' }}</el-tag>
+            <el-tag v-if="row.meta && row.meta.substitute" size="small" type="warning" effect="plain">临时替代</el-tag>
+            <el-tag v-else size="small" :type="row.origin === 'manual' ? 'warning' : 'info'">{{ row.origin === 'manual' ? '人工' : '自动' }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="status" label="状态" width="120">

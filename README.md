@@ -1,6 +1,6 @@
 # 经营数据采集编排台
 
-面向连锁餐饮品牌的多平台经营数据采集与编排系统：把 **接口拉取、网页导出、下载中心取件、人工上传兜底** 统一为「来源任务」，每个 **门店 × 平台 × 账号 × 日期窗口** 都有独立执行记录、完整证据链与可溯源的统一日经营事实。
+面向连锁餐饮品牌的多平台经营数据采集与编排系统：把 **接口拉取、网页导出、下载中心取件、人工上传兜底** 统一为「来源任务」，每个 **门店 × 平台 × 账号 × 日期窗口** 都有独立执行记录、完整证据链与可溯源的统一日经营事实。当某平台当天未能导出时，缺报看板会依据该门店×平台近30天到数节奏给出 **替代来源建议**（人工上传/收银系统/前一日预估），替代数据带独立来源标记且 **不混入正式日结**；正式文件到达后自动生成 **替换记录**，两种来源不会数字叠加。
 
 ## 技术栈
 
@@ -104,6 +104,7 @@ bash scripts/dev-down.sh
 | 8 人工补传 | 人工上传覆盖自动事实（origin=manual）；后续自动重跑不覆盖人工数据，自动文件标记 ignored_manual |
 | 9 错误文件 | 平台给错文件 → 识别 WRONG_FILE，文件保留为 rejected 证据 |
 | 10 页面改版 | 平台 DOM 改版 → 识别 ELEMENT_NOT_FOUND 并附失败现场截图 |
+| 11 缺报替代来源 | 建议带近30天平均到数/延迟概率/P90 依据；三类替代（人工上传/收银系统/前一日预估）带来源标记且不进正式日结；正式文件到达后生成替换记录而非叠加 |
 
 ### 手工验证路径
 
@@ -111,6 +112,10 @@ bash scripts/dev-down.sh
 2. **溯源**：门店日视图 → 每个指标可看到 平台/账号/人工或自动/原始文件名/哈希/修订/解析版本，点击文件名可下载原始文件。
 3. **人工接管**：用 `POST http://localhost:4500/__control` 打开场景（如 `{"path":"captcha:ALPHA","value":true}`），重跑任务后在「人工接管」页看到带截图的接管单，点「已处理，继续采集」。
 4. **映射异常**：修订场景（`revision:GAMMA:S001:<日期>=2`）后重跑 GAMMA 任务，在「映射异常」页看到 `VIP_DISCOUNT` 未知类型记录。
+5. **缺报替代来源**：选择一个尚未出数的日期（如当天），缺报清单中每个缺口展示近30天平均到数时间、延迟概率、P90 到数时间：
+   - 点「采用」前一日预估 → 看板出现「临时替代生效」标签，门店日视图可见替代数据独立区块，正式日结（daily_facts）不含该值；
+   - 生成当日任务待正式文件到达 → 替代条目变「已替换」，门店日视图出现替换记录（临时值 vs 正式值分别留痕）；
+   - 无收银系统的加盟门店（S003/S004）的「收银系统」建议明确显示不可用；S001/S002 直营门店可输入全店营业额临时参考（全店口径，不按平台拆分）。
 
 ### 模拟平台场景控制
 
@@ -149,6 +154,14 @@ bash scripts/dev-down.sh
 
 **证据链**：原始文件 + SHA256 + 下载时间 + 页面截图 + 执行步骤 + 解析版本（`parser.v1` / `map.<平台>.v1`）+ 入库批次，全部落库/落盘（`DATA_DIR`，compose 中为 `collector_data` 卷）。
 
+**缺报替代来源（本次新增）**：
+
+- **建议有依据**：`arrival_history` 记录每个 门店×平台×营业日 的基准/实际到数时间（种子为近30天确定性历史，正式文件解析后追加 `actual` 记录）。建议接口给出近30天 **平均到数时间、P90 到数时间、延迟概率（>30 分钟占比）、P90 延迟分钟数**，并结合最近正式日与近30天营业额波动率判断是否可采用前一日预估。
+- **三类替代**：①人工上传平台报表（平台口径，走上传接口并带 `substitute=1`）；②收银系统（仅 S001/S002 直营门店接入，全店合计口径，无法按平台拆分）；③前一日预估（取最近正式日同平台值，波动率高/无历史时不可用）。尚未到历史到数窗口时优先建议等待官方文件。
+- **隔离不混入**：替代数据只写 `substitute_entries`（人工替代文件在 `collected_files.meta.substitute=true` 标记），**不写 `daily_facts`**，门店日视图以独立区块展示并显著标注「预估值不得混入正式日结」。
+- **替换不叠加**：正式文件解析入库后，仍在生效的替代条目自动置 `replaced`，并在 `substitution_replacements` 留存「临时值 vs 正式值」替换记录；平台级替代须该门店×平台全部账号正式到齐才替换，避免部分账号替换整体。临时替代文件保留为 `superseded` 证据。
+- **防误用**：已有正式文件的单元格禁止再采用临时替代；POS 不可用门店的采用请求直接 400。
+
 ## API 摘要（前缀 `/api`，Bearer 认证）
 
 ```
@@ -164,8 +177,15 @@ GET  /interventions?status=     人工接管单
 POST /interventions/:id/resolve 人工已处理→恢复场景并重跑
 GET  /files /files/:id/download 文件证据
 POST /files/upload              人工补传（multipart）
-GET  /stores/:id/daily?date=    门店日视图（指标+溯源）
+GET  /stores/:id/daily?date=    门店日视图（正式指标+溯源 / 临时替代区块 / 替换记录）
 GET  /issues                    映射异常
+GET  /substitutions/suggest?storeId=&platformId=&date=
+                                缺报替代建议（近30天到数依据 + 人工/POS/预估可用性与理由）
+POST /substitutions/adopt       采用替代来源 {storeId,platformId,bizDate,method: pos|prev_estimate, values?}
+GET  /substitutions             替代采用记录（?date=&storeId=&platformId=&status=）
+GET  /substitutions/replacements 正式文件替换记录（临时值 vs 正式值）
+POST /substitutions/:id/cancel  取消生效中的临时替代
+POST /files/upload              人工补传（multipart；substitute=1 时为临时替代，不进正式日结）
 GET  /api/static/**             证据文件静态服务（原始文件/截图）
 ```
 
@@ -184,7 +204,9 @@ GET  /api/static/**             证据文件静态服务（原始文件/截图�
 
 ## 验证结论（实际执行）
 
-已在无 Docker 的 Linux 沙箱（Node 22 + 用户级 PostgreSQL 15 + Redis 7 + Chromium）中以 `node scripts/verify.mjs` 完整执行场景验证：**35 项断言全部通过**（输出见下文「验证记录」）。Docker Compose 配置与本地模式使用完全相同的构建与启动命令（`npm ci` → `npm run build` → `node dist/main.js`），worker 镜像为 Playwright 官方镜像。
+已在无 Docker 的 Linux 沙箱（Node 22 + 用户级 PostgreSQL 15 + Redis 7 + Chromium）中以 `node scripts/verify.mjs` 完整执行场景验证：**61 项断言全部通过、0 失败**（输出见下文「验证记录」）。Docker Compose 配置与本地模式使用完全相同的构建与启动命令（`npm ci` → `npm run build` → `node dist/main.js`），worker 镜像为 Playwright 官方镜像（含浏览器系统库，无需 `.syslibs` 处理）。
+
+> 无 root 的本地沙箱若 Chromium 缺系统库，可按 `scripts/dev-up.sh` 的探测逻辑把依赖解包到 `.syslibs/usr/lib/x86_64-linux-gnu`（脚本会自动设置 `LD_LIBRARY_PATH`）。
 
 ### 验证记录（最近一次完整执行）
 
@@ -199,4 +221,6 @@ GET  /api/static/**             证据文件静态服务（原始文件/截图�
 场景8 人工补传      4/4 通过（人工覆盖自动，自动不再覆盖人工）
 场景9 错误文件      3/3 通过（WRONG_FILE 识别并保留 rejected 证据）
 场景10 页面改版     3/3 通过（ELEMENT_NOT_FOUND 识别并截图）
+场景11 缺报替代来源 26/26 通过（建议依据/三类替代/来源标记/不混日结/正式文件替换不叠加）
+合计               61/61 通过
 ```
